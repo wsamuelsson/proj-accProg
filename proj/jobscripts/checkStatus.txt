@@ -1,0 +1,2 @@
+squeue --cluster=snowy --user=willis
+
