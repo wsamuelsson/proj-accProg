@@ -7,6 +7,11 @@
 #include<iostream>
 #include<cmath>
 #include<cuda_runtime.h>
+#include "cublas_v2.h"
+#include <curand_kernel.h>
+#include <cusparse.h>
+#include <cstdlib>
+#include <chrono>
 
 #include"matrix.h"
 
@@ -90,6 +95,7 @@ class crsMatrix{
         void print_csr();
         static void gemv(const crsMatrix<Number> &A, const std::vector<Number> &x, std::vector<Number> &y);
         static void cugemv(const crsMatrix<Number> &A, const std::vector<Number> &x, std::vector<Number> &y);
+        static void cuSparsegemv(const crsMatrix<Number> &A, const std::vector<Number> &x, std::vector<Number> &y);
         sell_c_sigma_data_t get_sell_c_sigma(const int C, const int sigma);
 
     private:
@@ -195,7 +201,7 @@ void crsMatrix<Number>::cugemv(const crsMatrix<Number> &A, const std::vector<Num
     //Copy
     AssertCuda(cudaMemcpy(&A_device[0], &values[0], nnz*sizeof(Number), cudaMemcpyHostToDevice));
     AssertCuda(cudaMemcpy(&row_ptr_device[0], &row_ptr[0], (n_rows+1)*sizeof(int), cudaMemcpyHostToDevice));
-    AssertCuda(cudaMemcpy(&colIdx_device[0], &colIdx[0], n_rows*sizeof(int), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&colIdx_device[0], &colIdx[0], nnz*sizeof(int), cudaMemcpyHostToDevice));
     AssertCuda(cudaMemcpy(&y_device[0], &y[0], y.size()*sizeof(Number), cudaMemcpyHostToDevice));
     AssertCuda(cudaMemcpy(&x_device[0], &x[0], x.size()*sizeof(Number), cudaMemcpyHostToDevice));
 
@@ -205,6 +211,196 @@ void crsMatrix<Number>::cugemv(const crsMatrix<Number> &A, const std::vector<Num
     cudaDeviceSynchronize();
     // Copy result back to host
     AssertCuda(cudaMemcpy(&y[0], &y_device[0], y.size() * sizeof(Number), cudaMemcpyDeviceToHost));
+    //Free on device
+    cudaFree(A_device);
+    cudaFree(row_ptr_device);
+    cudaFree(colIdx_device);
+    cudaFree(y_device);
+    cudaFree(x_device);
+}
+
+template<>
+void crsMatrix<float>::cuSparsegemv(const crsMatrix<float> &A, const std::vector<float> &x, std::vector<float> &y){
+    int n_rows = A.get_n_rows();
+    int n_cols = A.get_n_cols();
+
+    if (x.size() != n_cols || y.size() != n_rows) {
+        throw std::invalid_argument("Vector dimensions do not match matrix dimensions");
+    }
+
+    const int *row_ptr = A.get_row_ptr();
+    const int *colIdx = A.get_col_idx__ptr();
+    const float *values = A.get_static_values_ptr();
+    const int nnz = A.get_nnz();
+    
+ 
+
+    //Device ptrs
+    float *A_device;
+    int *row_ptr_device;
+    int *colIdx_device;
+    float *x_device;
+    float *y_device;
+
+    //Allocate on device
+    AssertCuda(cudaMalloc(&A_device, nnz * sizeof(float)));
+    AssertCuda(cudaMalloc(&row_ptr_device, (n_rows+1) * sizeof(int)));
+    AssertCuda(cudaMalloc(&colIdx_device, nnz*sizeof(int)));
+    AssertCuda(cudaMalloc(&y_device, y.size() *sizeof(float)));
+    AssertCuda(cudaMalloc(&x_device, x.size() *sizeof(float)));
+      
+    //Copy
+    AssertCuda(cudaMemcpy(&A_device[0], &values[0], nnz*sizeof(float), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&row_ptr_device[0], &row_ptr[0], (n_rows+1)*sizeof(int), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&colIdx_device[0], &colIdx[0], nnz*sizeof(int), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&y_device[0], &y[0], y.size()*sizeof(float), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&x_device[0], &x[0], x.size()*sizeof(float), cudaMemcpyHostToDevice));
+
+    cusparseHandle_t handle = NULL;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+    void*                dBuffer    = NULL;
+    size_t               bufferSize = 0;
+    cusparseStatus_t stat = cusparseCreate(&handle);
+
+    cusparseCreateCsr(&matA, n_rows, n_cols, nnz,
+                                      row_ptr_device, colIdx_device, A_device,
+                                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F);
+
+    cusparseCreateDnVec(&vecX, n_cols , x_device, CUDA_R_32F);
+    cusparseCreateDnVec(&vecY, n_rows , y_device, CUDA_R_32F);
+
+    cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                 &alpha, matA, vecX, &beta, vecY, CUDA_R_32F,
+                                 CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+
+    cudaMalloc(&dBuffer, bufferSize);
+    const auto t1 = std::chrono::steady_clock::now();
+  
+    if (stat != CUSPARSE_STATUS_SUCCESS){
+        std::cout << "CUSPARSE initialization failed\n";
+        std::abort();
+    }
+
+    stat = cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                 &alpha, matA, vecX, &beta, vecY, CUDA_R_32F,
+                                 CUSPARSE_SPMV_ALG_DEFAULT, dBuffer);
+    if (stat != CUSPARSE_STATUS_SUCCESS){
+        std::cout << "CUSPARSE operation failed\n";
+        std::abort();
+    }
+    cudaDeviceSynchronize();
+    const float time =std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - t1).count();
+    
+    
+  
+    cusparseDestroySpMat(matA);
+    cusparseDestroyDnVec(vecX);
+    cusparseDestroyDnVec(vecY);
+    cusparseDestroy(handle);
+    printf("%.17lf\n", time);
+
+    cudaDeviceSynchronize();
+    // Copy result back to host
+    AssertCuda(cudaMemcpy(&y[0], &y_device[0], y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    //Free on device
+    cudaFree(A_device);
+    cudaFree(row_ptr_device);
+    cudaFree(colIdx_device);
+    cudaFree(y_device);
+    cudaFree(x_device);
+}
+
+template<>
+void crsMatrix<double>::cuSparsegemv(const crsMatrix<double> &A, const std::vector<double> &x, std::vector<double> &y){
+    int n_rows = A.get_n_rows();
+    int n_cols = A.get_n_cols();
+
+    if (x.size() != n_cols || y.size() != n_rows) {
+        throw std::invalid_argument("Vector dimensions do not match matrix dimensions");
+    }
+
+    const int *row_ptr = A.get_row_ptr();
+    const int *colIdx = A.get_col_idx__ptr();
+    const double *values = A.get_static_values_ptr();
+    const int nnz = A.get_nnz();
+    
+ 
+
+    //Device ptrs
+    double *A_device;
+    int *row_ptr_device;
+    int *colIdx_device;
+    double *x_device;
+    double *y_device;
+
+    //Allocate on device
+    AssertCuda(cudaMalloc(&A_device, nnz * sizeof(double)));
+    AssertCuda(cudaMalloc(&row_ptr_device, (n_rows+1) * sizeof(int)));
+    AssertCuda(cudaMalloc(&colIdx_device, nnz*sizeof(int)));
+    AssertCuda(cudaMalloc(&y_device, y.size() *sizeof(double)));
+    AssertCuda(cudaMalloc(&x_device, x.size() *sizeof(double)));
+      
+    //Copy
+    AssertCuda(cudaMemcpy(&A_device[0], &values[0], nnz*sizeof(double), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&row_ptr_device[0], &row_ptr[0], (n_rows+1)*sizeof(int), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&colIdx_device[0], &colIdx[0], nnz*sizeof(int), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&y_device[0], &y[0], y.size()*sizeof(double), cudaMemcpyHostToDevice));
+    AssertCuda(cudaMemcpy(&x_device[0], &x[0], x.size()*sizeof(double), cudaMemcpyHostToDevice));
+
+    cusparseHandle_t handle = NULL;
+    float alpha = 1.0f;
+    float beta = 0.0f;
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX, vecY;
+    void*                dBuffer    = NULL;
+    size_t               bufferSize = 0;
+    cusparseStatus_t stat = cusparseCreate(&handle);
+
+    cusparseCreateCsr(&matA, n_rows, n_cols, nnz,
+                                      row_ptr_device, colIdx_device, A_device,
+                                      CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
+
+    cusparseCreateDnVec(&vecX, n_cols , x_device, CUDA_R_64F);
+    cusparseCreateDnVec(&vecY, n_rows , y_device, CUDA_R_64F);
+
+    cusparseSpMV_bufferSize(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                 &alpha, matA, vecX, &beta, vecY, CUDA_R_64F,
+                                 CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize);
+
+    cudaMalloc(&dBuffer, bufferSize);
+    const auto t1 = std::chrono::steady_clock::now();
+  
+    if (stat != CUSPARSE_STATUS_SUCCESS){
+        std::cout << "CUSPARSE initialization failed\n";
+        std::abort();
+    }
+
+    stat = cusparseSpMV(handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                 &alpha, matA, vecX, &beta, vecY, CUDA_R_32F,
+                                 CUSPARSE_SPMV_ALG_DEFAULT, dBuffer);
+    if (stat != CUSPARSE_STATUS_SUCCESS){
+        std::cout << "CUSPARSE operation failed\n";
+        std::abort();
+    }
+    cudaDeviceSynchronize();
+    const float time =std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - t1).count();
+    
+    
+  
+    cusparseDestroySpMat(matA);
+    cusparseDestroyDnVec(vecX);
+    cusparseDestroyDnVec(vecY);
+    cusparseDestroy(handle);
+    printf("%.17lf\n", time);
+
+    cudaDeviceSynchronize();
+    // Copy result back to host
+    AssertCuda(cudaMemcpy(&y[0], &y_device[0], y.size() * sizeof(double), cudaMemcpyDeviceToHost));
     //Free on device
     cudaFree(A_device);
     cudaFree(row_ptr_device);
